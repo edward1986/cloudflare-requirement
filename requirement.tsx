@@ -1,5 +1,5 @@
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*", // or specific origin
+  "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
     "Content-Type, Authorization, X-Requested-With, CreatedAt, createdat",
@@ -15,11 +15,17 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
+function sanitizeFileName(name) {
+  return (name || "")
+    .trim()
+    .replace(/[\/\\?%*:|"<>]/g, "-")
+    .replace(/\s+/g, "-");
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -30,35 +36,49 @@ export default {
       });
     }
 
-    // 🔁 Reverse-proxy route for files
     if (request.method === "GET" && url.pathname.startsWith("/files/")) {
       return handleFileProxy(request, env, url);
     }
 
-    // Upload endpoint
     if (request.method === "POST" && url.pathname === "/upload") {
       return handleUpload(request, env);
     }
+
     if (request.method === "POST" && url.pathname === "/upload-json") {
-      const name = url.searchParams.get("name") || "snapshot.json";
-      const bytes = await request.arrayBuffer();
-    
-      const now = new Date();
-      const ts = now.toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
-      const rand = Math.floor(Math.random() * 1_000_000_000).toString().padStart(9, "0");
-      const key = `${ts}_${rand}-${name}`;
-    
-      await env.R2_BUCKET.put(key, bytes, {
-        httpMetadata: { contentType: "application/json" },
-      });
-    
-      const origin = new URL(request.url).origin;
-      const fileUrl = `${origin}/files/${encodeURIComponent(key)}`;
-      return jsonResponse({ original: fileUrl }, 200);
+      return handleUploadJson(request, env, url);
     }
+
     return jsonResponse({ error: "Not found" }, 404);
   },
 };
+
+async function handleUploadJson(request, env, url) {
+  const requestedName = url.searchParams.get("name");
+
+  if (!requestedName) {
+    return jsonResponse({ error: "Missing required query param: name" }, 400);
+  }
+
+  const safeName = sanitizeFileName(requestedName);
+  const key = safeName.endsWith(".json") ? safeName : `${safeName}.json`;
+
+  const bytes = await request.arrayBuffer();
+
+  await env.R2_BUCKET.put(key, bytes, {
+    httpMetadata: { contentType: "application/json" },
+  });
+
+  const origin = new URL(request.url).origin;
+  const fileUrl = `${origin}/files/${encodeURIComponent(key)}`;
+
+  return jsonResponse(
+    {
+      key,
+      original: fileUrl,
+    },
+    200
+  );
+}
 
 async function handleUpload(request, env) {
   const contentType = request.headers.get("content-type") || "";
@@ -68,45 +88,42 @@ async function handleUpload(request, env) {
 
   const formData = await request.formData();
   const file = formData.get("file");
+  const requestedName = formData.get("name");
 
   if (!file || typeof file === "string") {
     return jsonResponse({ error: "Missing uploaded file field: file" }, 400);
   }
 
-  // create a unique key
-  const now = new Date();
-  const ts = now.toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
-  const rand = Math.floor(Math.random() * 1_000_000_000)
-    .toString()
-    .padStart(9, "0");
-  const safeName = file.name; // keep spaces as spaces
-  const key = `${ts}_${rand}-${safeName}`;
+  let safeName = "";
+  if (requestedName && typeof requestedName === "string") {
+    safeName = sanitizeFileName(requestedName);
+  } else {
+    safeName = sanitizeFileName(file.name);
+  }
 
-  // store in R2
+  const key = safeName;
+
   await env.R2_BUCKET.put(key, file.stream(), {
     httpMetadata: { contentType: file.type || "application/octet-stream" },
   });
 
-  // 🔁 Build URL pointing to THIS worker, not the R2 public URL
-  const origin = new URL(request.url).origin; // e.g. https://edge7-requirements...workers.dev
+  const origin = new URL(request.url).origin;
   const fileUrl = `${origin}/files/${encodeURIComponent(key)}`;
 
-  const payload = {
-    original: fileUrl,
-    thumb: fileUrl,
-    small: fileUrl,
-    medium: fileUrl,
-    large: fileUrl,
-    xlarge: fileUrl,
-  };
-
-  return jsonResponse(payload, 200);
+  return jsonResponse(
+    {
+      key,
+      original: fileUrl,
+      thumb: fileUrl,
+      small: fileUrl,
+      medium: fileUrl,
+      large: fileUrl,
+      xlarge: fileUrl,
+    },
+    200
+  );
 }
 
-
-
-
-// 🔁 Reverse proxy: GET /files/:key → stream from R2
 async function handleFileProxy(request, env, url) {
   const prefix = "/files/";
   const keyEncoded = url.pathname.slice(prefix.length);
@@ -127,7 +144,6 @@ async function handleFileProxy(request, env, url) {
     "Content-Type": obj.httpMetadata?.contentType || "application/octet-stream",
   };
 
-  // Optional: add Content-Length if you want
   if (obj.size != null) {
     headers["Content-Length"] = obj.size.toString();
   }
